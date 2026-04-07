@@ -1,6 +1,5 @@
 import os
 import requests
-import fal_client
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -8,6 +7,7 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FAL_KEY = os.getenv("FAL_KEY")
 
+# Временное хранилище в памяти
 user_state = {}
 
 TEMPLATES = {
@@ -34,7 +34,7 @@ def telegram_api(method: str, payload: dict):
         return None
 
 
-def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
+def send_message(chat_id: int, text: str, reply_markup=None):
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -107,7 +107,7 @@ def get_template_prompt(template_key: str) -> str:
     )
 
 
-def generate_with_flux(local_file_path: str, template_key: str) -> str | None:
+def generate_with_flux(local_file_path: str, template_key: str):
     if not FAL_KEY:
         print("ERROR: FAL_KEY is missing")
         return None
@@ -116,30 +116,74 @@ def generate_with_flux(local_file_path: str, template_key: str) -> str | None:
     print("FLUX PROMPT:", prompt)
 
     try:
-        # 1) Загружаем файл в storage fal
-        image_url = fal_client.upload_file(local_file_path, api_key=FAL_KEY)
-        print("FAL UPLOADED IMAGE URL:", image_url)
+        # 1) Загружаем локальный файл в fal storage
+        target_path = f"telegram/user_upload_{os.path.basename(local_file_path)}"
+        upload_url = f"https://api.fal.ai/v1/serverless/files/file/local/{target_path}"
+
+        headers = {
+            "Authorization": f"Key {FAL_KEY}"
+        }
+
+        with open(local_file_path, "rb") as f:
+            files = {
+                "file_upload": f
+            }
+            upload_response = requests.post(
+                upload_url,
+                headers=headers,
+                files=files,
+                timeout=120
+            )
+
+        print("UPLOAD STATUS:", upload_response.status_code)
+        print("UPLOAD TEXT:", upload_response.text)
+
+        if upload_response.status_code != 200:
+            return None
+
+        upload_json = upload_response.json()
+
+        uploaded_path = upload_json.get("file_path") or upload_json.get("path") or target_path
+        image_url = f"https://api.fal.ai/v1/serverless/files/file/{uploaded_path}"
+
+        print("FAL IMAGE URL:", image_url)
 
         # 2) Вызываем модель
-        result = fal_client.subscribe(
-            "fal-ai/flux-kontext/dev",
-            arguments={
-                "prompt": prompt,
-                "image_url": image_url
-            },
-            api_key=FAL_KEY
+        run_url = "https://fal.run/fal-ai/flux-kontext/dev"
+        payload = {
+            "prompt": prompt,
+            "image_url": image_url
+        }
+
+        model_headers = {
+            "Authorization": f"Key {FAL_KEY}",
+            "Content-Type": "application/json"
+        }
+
+        model_response = requests.post(
+            run_url,
+            headers=model_headers,
+            json=payload,
+            timeout=300
         )
 
-        print("FAL RESULT:", result)
+        print("MODEL STATUS:", model_response.status_code)
+        print("MODEL TEXT:", model_response.text)
 
+        if model_response.status_code != 200:
+            return None
+
+        result = model_response.json()
         images = result.get("images", [])
+
         if not images:
+            print("NO IMAGES IN RESPONSE")
             return None
 
         return images[0]["url"]
 
     except Exception as e:
-        print("FAL GENERATION ERROR:", str(e))
+        print("FAL ERROR:", str(e))
         return None
 
 
@@ -157,6 +201,7 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     print("TELEGRAM UPDATE:", data)
 
+    # Обычные сообщения
     if "message" in data:
         message = data["message"]
         chat_id = message["chat"]["id"]
@@ -192,9 +237,14 @@ async def telegram_webhook(request: Request):
             selected_template_key = state["template"]
             selected_template_name = TEMPLATES.get(selected_template_key, selected_template_key)
 
+            print("PHOTO FILE ID:", file_id)
+
+            # Получаем путь к файлу в Telegram
             file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
             file_info_response = requests.get(file_info_url, timeout=20)
             file_info = file_info_response.json()
+
+            print("FILE INFO:", file_info)
 
             if not file_info.get("ok"):
                 send_message(chat_id, "Could not get file info 😢")
@@ -203,6 +253,9 @@ async def telegram_webhook(request: Request):
             file_path = file_info["result"]["file_path"]
             file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
 
+            print("FILE URL:", file_url)
+
+            # Скачиваем фото
             photo_response = requests.get(file_url, timeout=30)
 
             if photo_response.status_code != 200:
@@ -214,6 +267,9 @@ async def telegram_webhook(request: Request):
 
             with open(local_file_path, "wb") as f:
                 f.write(photo_response.content)
+
+            print("PHOTO SAVED:", local_file_path)
+            print("SELECTED TEMPLATE:", selected_template_key)
 
             send_message(chat_id, f"Creating your {selected_template_name} photoshoot... ✨")
 
@@ -232,11 +288,14 @@ async def telegram_webhook(request: Request):
         else:
             send_message(chat_id, "Send /start to begin ✨")
 
+    # Нажатия на inline-кнопки
     elif "callback_query" in data:
         callback = data["callback_query"]
         callback_id = callback["id"]
         chat_id = callback["message"]["chat"]["id"]
         callback_data = callback.get("data", "")
+
+        print("CALLBACK DATA:", callback_data)
 
         if chat_id not in user_state:
             user_state[chat_id] = {
