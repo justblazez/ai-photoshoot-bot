@@ -1,13 +1,13 @@
 import os
 import requests
+import fal_client
 from fastapi import FastAPI, Request
 
 app = FastAPI()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+FAL_KEY = os.getenv("FAL_KEY")
 
-# Временное хранилище в памяти
-# Потом заменим на БД
 user_state = {}
 
 TEMPLATES = {
@@ -25,7 +25,7 @@ def telegram_api(method: str, payload: dict):
 
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
-        response = requests.post(url, json=payload, timeout=20)
+        response = requests.post(url, json=payload, timeout=30)
         print(f"TELEGRAM API {method} STATUS:", response.status_code)
         print(f"TELEGRAM API {method} RESPONSE:", response.text)
         return response
@@ -42,6 +42,15 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     telegram_api("sendMessage", payload)
+
+
+def send_photo(chat_id: int, photo_url: str, caption: str = ""):
+    payload = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+        "caption": caption
+    }
+    telegram_api("sendPhoto", payload)
 
 
 def answer_callback_query(callback_query_id: str, text: str = ""):
@@ -69,11 +78,77 @@ def send_template_buttons(chat_id: int):
     )
 
 
+def get_template_prompt(template_key: str) -> str:
+    prompts = {
+        "soft": (
+            "Turn this into a soft aesthetic portrait photoshoot. "
+            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Use pastel tones, clean beauty look, feminine styling, dreamy atmosphere, realistic photo."
+        ),
+        "flowers": (
+            "Turn this into a romantic flower photoshoot. "
+            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Add elegant flowers, soft lighting, feminine beauty, realistic editorial portrait."
+        ),
+        "studio": (
+            "Turn this into a professional studio photoshoot. "
+            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Use studio lighting, clean background, polished beauty look, realistic fashion portrait."
+        ),
+        "golden": (
+            "Turn this into a golden hour outdoor photoshoot. "
+            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Warm sunlight, glowing skin, cinematic but realistic portrait."
+        ),
+    }
+    return prompts.get(
+        template_key,
+        "Edit this portrait while keeping the same face, identity, and overall likeness. Realistic result."
+    )
+
+
+def generate_with_flux(local_file_path: str, template_key: str) -> str | None:
+    if not FAL_KEY:
+        print("ERROR: FAL_KEY is missing")
+        return None
+
+    prompt = get_template_prompt(template_key)
+    print("FLUX PROMPT:", prompt)
+
+    try:
+        # 1) Загружаем файл в storage fal
+        image_url = fal_client.upload_file(local_file_path, api_key=FAL_KEY)
+        print("FAL UPLOADED IMAGE URL:", image_url)
+
+        # 2) Вызываем модель
+        result = fal_client.subscribe(
+            "fal-ai/flux-kontext/dev",
+            arguments={
+                "prompt": prompt,
+                "image_url": image_url
+            },
+            api_key=FAL_KEY
+        )
+
+        print("FAL RESULT:", result)
+
+        images = result.get("images", [])
+        if not images:
+            return None
+
+        return images[0]["url"]
+
+    except Exception as e:
+        print("FAL GENERATION ERROR:", str(e))
+        return None
+
+
 @app.get("/")
 def root():
     return {
         "status": "bot is running",
-        "bot_token_exists": bool(BOT_TOKEN)
+        "bot_token_exists": bool(BOT_TOKEN),
+        "fal_key_exists": bool(FAL_KEY)
     }
 
 
@@ -82,7 +157,6 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     print("TELEGRAM UPDATE:", data)
 
-    # Обычные сообщения
     if "message" in data:
         message = data["message"]
         chat_id = message["chat"]["id"]
@@ -118,26 +192,17 @@ async def telegram_webhook(request: Request):
             selected_template_key = state["template"]
             selected_template_name = TEMPLATES.get(selected_template_key, selected_template_key)
 
-            print("PHOTO FILE ID:", file_id)
-
-            # 1. Получаем путь к файлу
             file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
             file_info_response = requests.get(file_info_url, timeout=20)
             file_info = file_info_response.json()
-
-            print("FILE INFO:", file_info)
 
             if not file_info.get("ok"):
                 send_message(chat_id, "Could not get file info 😢")
                 return {"ok": True}
 
             file_path = file_info["result"]["file_path"]
-
-            # 2. Формируем URL файла
             file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
-            print("FILE URL:", file_url)
 
-            # 3. Скачиваем фото
             photo_response = requests.get(file_url, timeout=30)
 
             if photo_response.status_code != 200:
@@ -145,33 +210,33 @@ async def telegram_webhook(request: Request):
                 return {"ok": True}
 
             os.makedirs("downloads", exist_ok=True)
-            file_name = f"downloads/user_{chat_id}.jpg"
+            local_file_path = f"downloads/user_{chat_id}.jpg"
 
-            with open(file_name, "wb") as f:
+            with open(local_file_path, "wb") as f:
                 f.write(photo_response.content)
 
-            print("PHOTO SAVED:", file_name)
-            print("SELECTED TEMPLATE:", selected_template_key)
+            send_message(chat_id, f"Creating your {selected_template_name} photoshoot... ✨")
 
-            send_message(
+            result_image_url = generate_with_flux(local_file_path, selected_template_key)
+
+            if not result_image_url:
+                send_message(chat_id, "Generation failed 😢 Try again in a minute.")
+                return {"ok": True}
+
+            send_photo(
                 chat_id,
-                f"Photo received & saved ✅\nStyle: {selected_template_name}\n\nNext: AI generation 🔥"
+                result_image_url,
+                caption=f"Here’s your {selected_template_name} result 💖"
             )
 
         else:
-            send_message(
-                chat_id,
-                "Send /start to begin ✨"
-            )
+            send_message(chat_id, "Send /start to begin ✨")
 
-    # Нажатия на inline-кнопки
     elif "callback_query" in data:
         callback = data["callback_query"]
         callback_id = callback["id"]
         chat_id = callback["message"]["chat"]["id"]
         callback_data = callback.get("data", "")
-
-        print("CALLBACK DATA:", callback_data)
 
         if chat_id not in user_state:
             user_state[chat_id] = {
