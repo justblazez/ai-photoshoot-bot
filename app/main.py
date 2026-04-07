@@ -17,6 +17,7 @@ TEMPLATES = {
     "golden": "Golden Hour",
 }
 
+
 def telegram_api(method: str, payload: dict):
     if not BOT_TOKEN:
         print("ERROR: BOT_TOKEN is missing")
@@ -32,6 +33,7 @@ def telegram_api(method: str, payload: dict):
         print(f"TELEGRAM API {method} ERROR:", str(e))
         return None
 
+
 def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     payload = {
         "chat_id": chat_id,
@@ -40,6 +42,15 @@ def send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     if reply_markup:
         payload["reply_markup"] = reply_markup
     telegram_api("sendMessage", payload)
+
+
+def answer_callback_query(callback_query_id: str, text: str = ""):
+    payload = {
+        "callback_query_id": callback_query_id,
+        "text": text
+    }
+    telegram_api("answerCallbackQuery", payload)
+
 
 def send_template_buttons(chat_id: int):
     keyboard = {
@@ -57,12 +68,6 @@ def send_template_buttons(chat_id: int):
         reply_markup=keyboard
     )
 
-def answer_callback_query(callback_query_id: str, text: str = ""):
-    payload = {
-        "callback_query_id": callback_query_id,
-        "text": text
-    }
-    telegram_api("answerCallbackQuery", payload)
 
 @app.get("/")
 def root():
@@ -71,20 +76,19 @@ def root():
         "bot_token_exists": bool(BOT_TOKEN)
     }
 
+
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     data = await request.json()
     print("TELEGRAM UPDATE:", data)
 
-    # 1) Обработка обычных сообщений
+    # Обычные сообщения
     if "message" in data:
         message = data["message"]
         chat_id = message["chat"]["id"]
         text = message.get("text", "")
 
-        # Команда /start
         if text == "/start":
-            # Инициализируем пользователя
             if chat_id not in user_state:
                 user_state[chat_id] = {
                     "template": None,
@@ -97,7 +101,6 @@ async def telegram_webhook(request: Request):
             )
             send_template_buttons(chat_id)
 
-        # Если пришло фото
         elif "photo" in message:
             state = user_state.get(chat_id)
 
@@ -115,14 +118,45 @@ async def telegram_webhook(request: Request):
             selected_template_key = state["template"]
             selected_template_name = TEMPLATES.get(selected_template_key, selected_template_key)
 
-            # Пока просто подтверждаем приём фото
+            print("PHOTO FILE ID:", file_id)
+
+            # 1. Получаем путь к файлу
+            file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
+            file_info_response = requests.get(file_info_url, timeout=20)
+            file_info = file_info_response.json()
+
+            print("FILE INFO:", file_info)
+
+            if not file_info.get("ok"):
+                send_message(chat_id, "Could not get file info 😢")
+                return {"ok": True}
+
+            file_path = file_info["result"]["file_path"]
+
+            # 2. Формируем URL файла
+            file_url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}"
+            print("FILE URL:", file_url)
+
+            # 3. Скачиваем фото
+            photo_response = requests.get(file_url, timeout=30)
+
+            if photo_response.status_code != 200:
+                send_message(chat_id, "Could not download photo 😢")
+                return {"ok": True}
+
+            os.makedirs("downloads", exist_ok=True)
+            file_name = f"downloads/user_{chat_id}.jpg"
+
+            with open(file_name, "wb") as f:
+                f.write(photo_response.content)
+
+            print("PHOTO SAVED:", file_name)
+            print("SELECTED TEMPLATE:", selected_template_key)
+
             send_message(
                 chat_id,
-                f"Photo received ✅\nSelected style: {selected_template_name}\n\nNext: we’ll connect AI generation."
+                f"Photo received & saved ✅\nStyle: {selected_template_name}\n\nNext: AI generation 🔥"
             )
-
-            print("PHOTO FILE ID:", file_id)
-            print("SELECTED TEMPLATE:", selected_template_key)
 
         else:
             send_message(
@@ -130,7 +164,7 @@ async def telegram_webhook(request: Request):
                 "Send /start to begin ✨"
             )
 
-    # 2) Обработка нажатий на inline-кнопки
+    # Нажатия на inline-кнопки
     elif "callback_query" in data:
         callback = data["callback_query"]
         callback_id = callback["id"]
