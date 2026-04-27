@@ -1,5 +1,6 @@
 import os
 import requests
+import fal_client
 from fastapi import FastAPI, Request
 
 app = FastAPI()
@@ -7,7 +8,6 @@ app = FastAPI()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 FAL_KEY = os.getenv("FAL_KEY")
 
-# Временное хранилище в памяти
 user_state = {}
 
 TEMPLATES = {
@@ -81,29 +81,34 @@ def send_template_buttons(chat_id: int):
 def get_template_prompt(template_key: str) -> str:
     prompts = {
         "soft": (
-            "Turn this into a soft aesthetic portrait photoshoot. "
-            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Turn this image into a soft aesthetic portrait photoshoot. "
+            "Keep the same person, same face, same identity, same facial features, same skin tone, same age, and same likeness. "
+            "Do not change the face. Do not change identity. "
             "Use pastel tones, clean beauty look, feminine styling, dreamy atmosphere, realistic photo."
         ),
         "flowers": (
-            "Turn this into a romantic flower photoshoot. "
-            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Turn this image into a romantic flower photoshoot. "
+            "Keep the same person, same face, same identity, same facial features, same skin tone, same age, and same likeness. "
+            "Do not change the face. Do not change identity. "
             "Add elegant flowers, soft lighting, feminine beauty, realistic editorial portrait."
         ),
         "studio": (
-            "Turn this into a professional studio photoshoot. "
-            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Turn this image into a professional studio photoshoot. "
+            "Keep the same person, same face, same identity, same facial features, same skin tone, same age, and same likeness. "
+            "Do not change the face. Do not change identity. "
             "Use studio lighting, clean background, polished beauty look, realistic fashion portrait."
         ),
         "golden": (
-            "Turn this into a golden hour outdoor photoshoot. "
-            "Keep the same face, identity, facial features, skin tone, age, and overall likeness. "
+            "Turn this image into a golden hour outdoor photoshoot. "
+            "Keep the same person, same face, same identity, same facial features, same skin tone, same age, and same likeness. "
+            "Do not change the face. Do not change identity. "
             "Warm sunlight, glowing skin, cinematic but realistic portrait."
         ),
     }
+
     return prompts.get(
         template_key,
-        "Edit this portrait while keeping the same face, identity, and overall likeness. Realistic result."
+        "Edit this portrait while keeping the same person, same face, same identity, and same likeness. Realistic result."
     )
 
 
@@ -116,66 +121,22 @@ def generate_with_flux(local_file_path: str, template_key: str):
     print("FLUX PROMPT:", prompt)
 
     try:
-        # 1) Загружаем локальный файл в fal storage
-        target_path = f"telegram/user_upload_{os.path.basename(local_file_path)}"
-        upload_url = f"https://api.fal.ai/v1/serverless/files/file/local/{target_path}"
+        os.environ["FAL_KEY"] = FAL_KEY
 
-        headers = {
-            "Authorization": f"Key {FAL_KEY}"
-        }
+        image_url = fal_client.upload_file(local_file_path)
+        print("FAL UPLOADED IMAGE URL:", image_url)
 
-        with open(local_file_path, "rb") as f:
-            files = {
-                "file_upload": f
+        result = fal_client.subscribe(
+            "fal-ai/flux-kontext/dev",
+            arguments={
+                "prompt": prompt,
+                "image_url": image_url
             }
-            upload_response = requests.post(
-                upload_url,
-                headers=headers,
-                files=files,
-                timeout=120
-            )
-
-        print("UPLOAD STATUS:", upload_response.status_code)
-        print("UPLOAD TEXT:", upload_response.text)
-
-        if upload_response.status_code != 200:
-            return None
-
-        upload_json = upload_response.json()
-
-        uploaded_path = upload_json.get("file_path") or upload_json.get("path") or target_path
-        image_url = f"https://api.fal.ai/v1/serverless/files/file/{uploaded_path}"
-
-        print("FAL IMAGE URL:", image_url)
-
-        # 2) Вызываем модель
-        run_url = "https://fal.run/fal-ai/flux-kontext/dev"
-        payload = {
-            "prompt": prompt,
-            "image_url": image_url
-        }
-
-        model_headers = {
-            "Authorization": f"Key {FAL_KEY}",
-            "Content-Type": "application/json"
-        }
-
-        model_response = requests.post(
-            run_url,
-            headers=model_headers,
-            json=payload,
-            timeout=300
         )
 
-        print("MODEL STATUS:", model_response.status_code)
-        print("MODEL TEXT:", model_response.text)
+        print("FAL RESULT:", result)
 
-        if model_response.status_code != 200:
-            return None
-
-        result = model_response.json()
         images = result.get("images", [])
-
         if not images:
             print("NO IMAGES IN RESPONSE")
             return None
@@ -201,7 +162,6 @@ async def telegram_webhook(request: Request):
     data = await request.json()
     print("TELEGRAM UPDATE:", data)
 
-    # Обычные сообщения
     if "message" in data:
         message = data["message"]
         chat_id = message["chat"]["id"]
@@ -239,7 +199,6 @@ async def telegram_webhook(request: Request):
 
             print("PHOTO FILE ID:", file_id)
 
-            # Получаем путь к файлу в Telegram
             file_info_url = f"https://api.telegram.org/bot{BOT_TOKEN}/getFile?file_id={file_id}"
             file_info_response = requests.get(file_info_url, timeout=20)
             file_info = file_info_response.json()
@@ -255,7 +214,6 @@ async def telegram_webhook(request: Request):
 
             print("FILE URL:", file_url)
 
-            # Скачиваем фото
             photo_response = requests.get(file_url, timeout=30)
 
             if photo_response.status_code != 200:
@@ -288,7 +246,6 @@ async def telegram_webhook(request: Request):
         else:
             send_message(chat_id, "Send /start to begin ✨")
 
-    # Нажатия на inline-кнопки
     elif "callback_query" in data:
         callback = data["callback_query"]
         callback_id = callback["id"]
@@ -305,6 +262,7 @@ async def telegram_webhook(request: Request):
 
         if callback_data.startswith("tpl_"):
             template_key = callback_data.replace("tpl_", "")
+
             if template_key in TEMPLATES:
                 user_state[chat_id]["template"] = template_key
 
